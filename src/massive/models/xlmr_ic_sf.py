@@ -40,6 +40,7 @@ class XLMRIntentClassSlotFill(RobertaPreTrainedModel):
         self.config = config
         self.num_intent_labels = len(intent_label_dict)
         self.num_slot_labels = len(slot_label_dict)
+        self.consistency_ignore_slot_label = [int(k) for k, v in slot_label_dict.items() if v == 'Other'][0]
 
         # configure model to output all hidden states if not using last hidden layer
         # valid values for hidden_state_layer_for_class are 'last' or a layer number
@@ -82,7 +83,22 @@ class XLMRIntentClassSlotFill(RobertaPreTrainedModel):
             dropout_rate=dropout
         )
 
+    def _sequence_to_bag_of_slot_types(self, seq):
+        # seq: [sequence_length, num_features]
+        # It is assumed that the values along the feature axis represent a (near-)one-hot vector so we can do a sum over the feature axis to get a bag of slot types
+        shifted_seq = torch.roll(seq, shifts=1, dims=0)  # shift left by one
+        shifted_seq[0] = -1  # dummy fill value at front
+        consecutive_duplicate = torch.all((seq == shifted_seq), dim=1)
+        seq_unique_consecutive = ~consecutive_duplicate
+        bag_of_slot_types = torch.sum(seq[seq_unique_consecutive], dim=0) # remove identical consecutive values since that represents an I tag and is not a new span
+        return bag_of_slot_types
+
     def forward(self, input_ids, attention_mask, intent_num, slots_num, token_type_ids=None):
+        # TODO: reformat separator between source and target sequences from ['▁', '</s>'] to ['</s>'] in `input_ids`
+        # which also requires adjusting `attention_mask` and `slots_num`
+        # separator token '</s>' first occurs at position (((input_ids == 2).cumsum(1) == 1).cumsum(1) == 1).nonzero()
+        # and occurs for the second time at position (((input_ids == 2).cumsum(1) == 2).cumsum(1) == 1).nonzero() # since separator token is same as eos token
+
         # sequence_output, pooled_output, (hidden_states), (attentions)
         outputs = self.xlmr(input_ids, attention_mask=attention_mask,
                             token_type_ids=token_type_ids)
@@ -121,10 +137,32 @@ class XLMRIntentClassSlotFill(RobertaPreTrainedModel):
                 active_logits = slot_logits.view(-1, self.num_slot_labels)[active_loss]
                 active_labels = slots_num.view(-1)[active_loss]
                 slot_loss = slot_loss_fct(active_logits, active_labels)
+                if 'consistency_loss_coef' in self.config.to_dict().keys():
+                    left_side_mask = ((input_ids == 2).cumsum(1) == 0) * (input_ids != 0) * (slots_num != -100)  # before first occurrence of SEP; exclude BOS token; exclude -100 subtoken continuation label
+                    right_side_mask = ((input_ids == 2).cumsum(1) == 1) * (input_ids != 2) * (slots_num != -100)  # between first and second occurrence of SEP/EOS; exclude SEP token; exclude -100 subtoken continuation label
+                    one_hot_slots = torch.nn.functional.softmax(slot_logits*1e10, dim=2)  # convert each token's distribution over slot types into a near-one-hot
+                    left_side_one_hot_slots = one_hot_slots * left_side_mask.unsqueeze(-1)
+                    right_side_one_hot_slots = one_hot_slots * right_side_mask.unsqueeze(-1)
+                    slot_type_mask = torch.ones(one_hot_slots.shape[2], device=one_hot_slots.device)
+                    slot_type_mask[self.consistency_ignore_slot_label] = 0
+                    symmetric_diff_size = torch.zeros(one_hot_slots.shape[0], device=one_hot_slots.device)
+                    # Since each example has a variable number of predicted spans, there is no straightforward way to do this using tensor operations like indexing or gathering. Using indexing with `left_side_mask` or `right_side_mask` flattens the resulting tensor and so we lose information about the separation of each example.
+                    # Additionally, we must avoid overcounting multi-token slots (since each token will be tagged with the same label rather than with an I-like label), so we must deduplicate consecutive runs of the same label; however torch.unique_consecutive() does not have a gradient, so we must implement our own version of the method. If the tags were BIO-like, we could do batch operations like torch.sum(left_side_one_hot_slots, dim=1) and then mask out I and O tags.
+                    for i in range(left_side_one_hot_slots.shape[0]):
+                        left_side_bag_of_slots = self._sequence_to_bag_of_slot_types(left_side_one_hot_slots[i][left_side_mask[i]])
+                        right_side_bag_of_slots = self._sequence_to_bag_of_slot_types(right_side_one_hot_slots[i][right_side_mask[i]])
+                        left_side_bag_of_slots *= slot_type_mask  # mask out indices of `left_side_bag_of_slots` and `right_side_bag_of_slots` corresponding to 'Other'
+                        right_side_bag_of_slots *= slot_type_mask
+                        symmetric_diff_size[i] = torch.sum(torch.abs(left_side_bag_of_slots - right_side_bag_of_slots))
+
+                    consistency_loss = torch.mean(symmetric_diff_size)
+                    total_loss += self.config.consistency_loss_coef * consistency_loss
             else:
                 slot_loss = slot_loss_fct(
                     slot_logits.view(-1, self.num_slot_labels), slots_num.view(-1)
                 )
+                if 'consistency_loss_coef' in self.config.to_dict().keys():
+                    raise NotImplementedError
             total_loss += self.config.slot_loss_coef * slot_loss
 
         outputs = (total_loss, (intent_logits, slot_logits))
